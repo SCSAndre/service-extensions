@@ -1,0 +1,80 @@
+test {
+  name: "MaskPhoneHeaderInRequest"
+  request_headers {
+    input {
+      header { key: "x-phone" value: "555-987-6543" }
+    }
+    result {
+      has_header { key: "x-phone" value: "XXX-XXX-6543" }
+    }
+  }
+}
+
+test {
+  name: "MaskEmailHeaderInRequest"
+  request_headers {
+    input {
+      header { key: "x-email" value: "alice.smith@example.org" }
+    }
+    result {
+      has_header { key: "x-email" value: "a**@example.org" }
+    }
+  }
+}
+
+test {
+  name: "MaskPhoneHeaderInResponse"
+  response_headers {
+    input {
+      header { key: "x-phone" value: "123-456-7890" }
+    }
+    result {
+      has_header { key: "x-phone" value: "XXX-XXX-7890" }
+    }
+  }
+}
+
+test {
+  name: "MaskEmailHeaderInResponse"
+  response_headers {
+    input {
+      header { key: "x-email" value: "john.doe@test.com" }
+    }
+    result {
+      has_header { key: "x-email" value: "j**@test.com" }
+    }
+  }
+}
+
+test {
+  name: "MaskPIIInResponseBody"
+  response_headers {
+    input {
+      header { key: "content-type" value: "text/plain" }
+    }
+  }
+  response_body {
+    input {
+      content: "Contact us at support@company.com or call 555-123-4567.\n"
+      "Another email: user.name@example.org and phone: 888-777-6666"
+    }
+    result {
+      body {
+        exact: "Contact us at s**@company.com or call XXX-XXX-4567.\n"
+        "Another email: u**@example.org and phone: XXX-XXX-6666"
+      }
+    }
+  }
+}
+
+test {
+  name: "MaskPIIInOtherHeaders"
+  request_headers {
+    input {
+      header { key: "custom-header" value: "Email: contact@test.com, Phone: 555-111-2222" }
+    }
+    result {
+      has_header { key: "custom-header" value: "Email: c**@test.com, Phone: XXX-XXX-2222" }
+    }
+  }
+}
