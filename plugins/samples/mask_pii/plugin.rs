@@ -1,4 +1,4 @@
-// Copyright 2024 Google LLC
+// Copyright 2025 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,22 +16,59 @@
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use regex::Regex;
-use std::str;
+use std::borrow::Cow;
+use std::rc::Rc;
 
-#[no_mangle]
-pub fn _start() {
+proxy_wasm::main! {{
     proxy_wasm::set_log_level(LogLevel::Trace);
-    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> { Box::new(MaskPiiRoot::default()) });
+    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
+        Box::new(MyRootContext::new())
+    });
+}}
+
+struct MyRootContext {
+    phone_regex: Option<Rc<Regex>>,
+    email_regex: Option<Rc<Regex>>,
 }
 
-#[derive(Default)]
-struct MaskPiiRoot;
+impl MyRootContext {
+    fn new() -> Self {
+        MyRootContext {
+            phone_regex: None,
+            email_regex: None,
+        }
+    }
+}
 
-impl Context for MaskPiiRoot {}
+impl Context for MyRootContext {}
 
-impl RootContext for MaskPiiRoot {
+impl RootContext for MyRootContext {
+    fn on_configure(&mut self, _config_size: usize) -> bool {
+        // Phone regex for format XXX-XXX-XXXX
+        let phone_regex = Regex::new(r"(\d{3})-(\d{3})-(\d{4})");
+        if phone_regex.is_err() {
+            log(LogLevel::Error, &format!("Failed to compile phone regex: {:?}", phone_regex.err()));
+            return false;
+        }
+
+        // Email regex - captures username and domain parts separately
+        let email_regex = Regex::new(r"([a-zA-Z0-9._%+\-]+)@([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})");
+        if email_regex.is_err() {
+            log(LogLevel::Error, &format!("Failed to compile email regex: {:?}", email_regex.err()));
+            return false;
+        }
+
+        self.phone_regex = Some(Rc::new(phone_regex.unwrap()));
+        self.email_regex = Some(Rc::new(email_regex.unwrap()));
+
+        true
+    }
+
     fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
-        Some(Box::new(MaskPiiHttp { context_id }))
+        Some(Box::new(MyHttpContext::new(
+            self.phone_regex.clone(),
+            self.email_regex.clone(),
+        )))
     }
 
     fn get_type(&self) -> Option<ContextType> {
@@ -39,142 +76,187 @@ impl RootContext for MaskPiiRoot {
     }
 }
 
-struct MaskPiiHttp {
-    context_id: u32,
+struct MyHttpContext {
+    phone_regex: Option<Rc<Regex>>,
+    email_regex: Option<Rc<Regex>>,
 }
 
-impl MaskPiiHttp {
-    // Masks phone numbers in format XXX-XXX-XXXX
-    fn mask_phone(&self, phone: &str) -> String {
-        let re = Regex::new(r"(\d{3})-(\d{3})-(\d{4})").unwrap();
-        re.replace_all(phone, "XXX-XXX-$3").to_string()
+impl MyHttpContext {
+    fn new(
+        phone_regex: Option<Rc<Regex>>,
+        email_regex: Option<Rc<Regex>>,
+    ) -> Self {
+        MyHttpContext {
+            phone_regex,
+            email_regex,
+        }
     }
 
-    // Masks email addresses in format x**@domain.com
-    fn mask_email(&self, email: &str) -> String {
-        let re = Regex::new(r"([a-zA-Z0-9._%+\-]+)@([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})").unwrap();
-        re.replace_all(email, |caps: &regex::Captures| {
-            let username = caps.get(1).map_or("", |m| m.as_str());
-            let domain = caps.get(2).map_or("", |m| m.as_str());
+    /// Process headers with a uniform approach for both request and response
+    fn process_headers(&mut self, is_request: bool) -> Action {
+        // Get headers
+        let headers = if is_request {
+            self.get_http_request_headers()
+        } else {
+            self.get_http_response_headers()
+        };
 
-            if let Some(first_char) = username.chars().next() {
-                format!("{}**@{}", first_char, domain)
+        let mut changed = false;
+        let mut updated_headers = Vec::with_capacity(headers.len());
+
+        // Process specific headers (x-phone, x-email) first
+        let mut phone_header_value = String::new();
+        let mut email_header_value = String::new();
+        let mut has_phone_header = false;
+        let mut has_email_header = false;
+
+        for (name, value) in &headers {
+            if name == "x-phone" {
+                phone_header_value = value.clone();
+                has_phone_header = true;
+            } else if name == "x-email" {
+                email_header_value = value.clone();
+                has_email_header = true;
+            }
+        }
+
+        // Mask x-phone if present
+        if has_phone_header {
+            let mut phone_value = phone_header_value;
+            if self.mask_pii(&mut phone_value) {
+                changed = true;
+                if is_request {
+                    self.set_http_request_header("x-phone", Some(&phone_value));
+                } else {
+                    self.set_http_response_header("x-phone", Some(&phone_value));
+                }
+            }
+        }
+
+        // Mask x-email if present
+        if has_email_header {
+            let mut email_value = email_header_value;
+            if self.mask_pii(&mut email_value) {
+                changed = true;
+                if is_request {
+                    self.set_http_request_header("x-email", Some(&email_value));
+                } else {
+                    self.set_http_response_header("x-email", Some(&email_value));
+                }
+            }
+        }
+
+        // Process all other headers for PII
+        for (name, value) in headers {
+            if name != "x-phone" && name != "x-email" {
+                // Performance optimization: check if there's PII before processing
+                if let (Some(ref phone_re), Some(ref email_re)) = (&self.phone_regex, &self.email_regex) {
+                    if !phone_re.is_match(&value) && !email_re.is_match(&value) {
+                        updated_headers.push((name, value));
+                        continue;
+                    }
+                }
+
+                // Process header value
+                let mut new_value = value;
+                if self.mask_pii(&mut new_value) {
+                    changed = true;
+                }
+                updated_headers.push((name, new_value));
+            }
+        }
+
+        // Update headers if any values changed
+        if changed {
+            let new_headers_refs: Vec<(&str, &str)> = updated_headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+
+            if is_request {
+                self.set_http_request_headers(new_headers_refs);
             } else {
-                format!("@{}", domain)
+                self.set_http_response_headers(new_headers_refs);
             }
-        }).to_string()
+        }
+
+        Action::Continue
+    }
+
+    /// Mask PII (phone numbers and email addresses) in-place on a given string,
+    /// returning `true` if modifications occurred.
+    fn mask_pii(&self, text: &mut String) -> bool {
+        let mut modified = false;
+
+        // Mask phone numbers
+        if let Some(ref phone_re) = self.phone_regex {
+            let replaced = phone_re.replace_all(text, "XXX-XXX-$3");
+            if replaced != Cow::Borrowed(text.as_str()) {
+                *text = replaced.to_string();
+                modified = true;
+            }
+        }
+
+        // Mask email addresses
+        if let Some(ref email_re) = self.email_regex {
+            let replaced = email_re.replace_all(text, |caps: &regex::Captures| {
+                let username = &caps[1];
+                let domain = &caps[2];
+
+                if !username.is_empty() {
+                    // Keep first character of username, mask the rest with **
+                    format!("{}**@{}", &username[0..1], domain)
+                } else {
+                    caps[0].to_string()
+                }
+            });
+
+            if replaced != Cow::Borrowed(text.as_str()) {
+                *text = replaced.to_string();
+                modified = true;
+            }
+        }
+
+        modified
     }
 }
 
-impl Context for MaskPiiHttp {}
+impl Context for MyHttpContext {}
 
-impl HttpContext for MaskPiiHttp {
-    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
-        // Process x-phone header
-        if let Some(value) = self.get_http_request_header("x-phone") {
-            let masked = self.mask_phone(&value);
-            if masked != value {
-                self.set_http_request_header("x-phone", Some(&masked));
-            }
-        }
+impl HttpContext for MyHttpContext {
+    fn on_http_request_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
+        // Set Accept-Encoding to ensure uncompressed responses
+        self.set_http_request_header("accept-encoding", Some("identity"));
 
-        // Process x-email header
-        if let Some(value) = self.get_http_request_header("x-email") {
-            let masked = self.mask_email(&value);
-            if masked != value {
-                self.set_http_request_header("x-email", Some(&masked));
-            }
-        }
-
-        // Process all other headers
-        let headers = self.get_http_request_headers();
-        for (name, value) in headers.iter() {
-            if name != "x-phone" && name != "x-email" {
-                let mut new_value = value.clone();
-                let mut changed = false;
-
-                // Check for phone numbers
-                let phone_masked = self.mask_phone(&new_value);
-                if phone_masked != new_value {
-                    new_value = phone_masked;
-                    changed = true;
-                }
-
-                // Check for email addresses
-                let email_masked = self.mask_email(&new_value);
-                if email_masked != new_value {
-                    new_value = email_masked;
-                    changed = true;
-                }
-
-                if changed {
-                    self.set_http_request_header(name, Some(&new_value));
-                }
-            }
-        }
-
-        Action::Continue
+        // Process request headers
+        self.process_headers(true)
     }
 
-    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
-        // Process x-phone header
-        if let Some(value) = self.get_http_response_header("x-phone") {
-            let masked = self.mask_phone(&value);
-            if masked != value {
-                self.set_http_response_header("x-phone", Some(&masked));
-            }
-        }
-
-        // Process x-email header
-        if let Some(value) = self.get_http_response_header("x-email") {
-            let masked = self.mask_email(&value);
-            if masked != value {
-                self.set_http_response_header("x-email", Some(&masked));
-            }
-        }
-
-        // Process all other headers
-        let headers = self.get_http_response_headers();
-        for (name, value) in headers.iter() {
-            if name != "x-phone" && name != "x-email" {
-                let mut new_value = value.clone();
-                let mut changed = false;
-
-                // Check for phone numbers
-                let phone_masked = self.mask_phone(&new_value);
-                if phone_masked != new_value {
-                    new_value = phone_masked;
-                    changed = true;
-                }
-
-                // Check for email addresses
-                let email_masked = self.mask_email(&new_value);
-                if email_masked != new_value {
-                    new_value = email_masked;
-                    changed = true;
-                }
-
-                if changed {
-                    self.set_http_response_header(name, Some(&new_value));
-                }
-            }
-        }
-
-        Action::Continue
+    fn on_http_response_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
+        // Process response headers
+        self.process_headers(false)
     }
 
-    fn on_http_response_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
-        if !end_of_stream {
-            return Action::Pause;
+    fn on_http_response_body(&mut self, body_size: usize, _end_of_stream: bool) -> Action {
+        if body_size == 0 {
+            return Action::Continue;
         }
 
+        // Get response body
         if let Some(body_bytes) = self.get_http_response_body(0, body_size) {
-            if let Ok(body_string) = str::from_utf8(&body_bytes) {
-                let mut masked_body = self.mask_phone(body_string);
-                masked_body = self.mask_email(&masked_body);
-
-                if masked_body != body_string {
-                    self.set_http_response_body(0, body_size, masked_body.as_bytes());
+            // Convert to string for processing, assuming UTF-8 encoding
+            match String::from_utf8(body_bytes) {
+                Ok(mut body_string) => {
+                    // Mask PII in body
+                    if self.mask_pii(&mut body_string) {
+                        // Only update if changes were made
+                        if let Err(err) = self.set_http_response_body(0, body_string.len(), body_string.as_bytes()) {
+                            log(LogLevel::Error, &format!("Failed to replace response body: {:?}", err));
+                        }
+                    }
+                }
+                Err(err) => {
+                    log(LogLevel::Error, &format!("Failed to convert body to string: {:?}", err));
                 }
             }
         }
