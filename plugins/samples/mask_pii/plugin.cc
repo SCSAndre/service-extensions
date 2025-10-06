@@ -44,7 +44,8 @@ class MyHttpContext : public Context {
     processHeaders(
         [this]() { return getRequestHeaderPairs(); },
         [this](std::string_view name) { return getRequestHeader(name); },
-        [this](std::string_view name, std::string_view value) { replaceRequestHeader(name, value); });
+        [this](std::string_view name, std::string_view value) { replaceRequestHeader(name, value); }
+    );
     return FilterHeadersStatus::Continue;
   }
 
@@ -52,7 +53,8 @@ class MyHttpContext : public Context {
     processHeaders(
         [this]() { return getResponseHeaderPairs(); },
         [this](std::string_view name) { return getResponseHeader(name); },
-        [this](std::string_view name, std::string_view value) { replaceResponseHeader(name, value); });
+        [this](std::string_view name, std::string_view value) { replaceResponseHeader(name, value); }
+    );
     return FilterHeadersStatus::Continue;
   }
 
@@ -117,12 +119,11 @@ class MyHttpContext : public Context {
     return re2::RE2::GlobalReplace(&value, *root_->phone_regex, "XXX-XXX-\\3") > 0;
   }
 
-  // Masks email addresses in the format x**@domain.com, preserving the first character and domain
+  // Masks email addresses in the format x**@domain.com
   bool maskEmail(std::string& value) {
-    // Extract first character and domain from the general email pattern
-    std::string first_char = "\\1";
-    first_char = first_char.substr(0, 1); // Take only the first character
-    return re2::RE2::GlobalReplace(&value, *root_->email_regex, first_char + "**@\\2") > 0;
+    // Create a pattern that specifically captures just the first character of the username
+    std::string pattern = "([a-zA-Z0-9._%+\\-])[a-zA-Z0-9._%+\\-]*@([a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,})";
+    return re2::RE2::GlobalReplace(&value, pattern, "\\1**@\\2") > 0;
   }
 };
 
