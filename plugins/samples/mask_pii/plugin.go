@@ -34,16 +34,14 @@ type vmContext struct {
 
 type pluginContext struct {
 	types.DefaultPluginContext
-	phoneRegex     *regexp.Regexp
-	emailRegex     *regexp.Regexp
-	emailMaskRegex *regexp.Regexp
+	phoneRegex *regexp.Regexp
+	emailRegex *regexp.Regexp
 }
 
 type httpContext struct {
 	types.DefaultHttpContext
-	phoneRegex     *regexp.Regexp
-	emailRegex     *regexp.Regexp
-	emailMaskRegex *regexp.Regexp
+	phoneRegex *regexp.Regexp
+	emailRegex *regexp.Regexp
 }
 
 func (*vmContext) NewPluginContext(contextID uint32) types.PluginContext {
@@ -52,52 +50,13 @@ func (*vmContext) NewPluginContext(contextID uint32) types.PluginContext {
 		phoneRegex: regexp.MustCompile(`(\d{3})-(\d{3})-(\d{4})`),
 		// Email regex - captures username and domain parts separately
 		emailRegex: regexp.MustCompile(`([a-zA-Z0-9._%+\-]+)@([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})`),
-		// Email regex specifically for masking - captures just the first character
-		emailMaskRegex: regexp.MustCompile(`([a-zA-Z0-9._%+\-])[a-zA-Z0-9._%+\-]*@`),
 	}
 }
 
 func (pluginContext *pluginContext) NewHttpContext(contextID uint32) types.HttpContext {
 	return &httpContext{
-		phoneRegex:     pluginContext.phoneRegex,
-		emailRegex:     pluginContext.emailRegex,
-		emailMaskRegex: pluginContext.emailMaskRegex,
-	}
-}
-
-func (ctx *httpContext) processHeaders(
-	getHeader func(string) (string, error),
-	replaceHeader func(string, string) error,
-	getAllHeaders func() ([][2]string, error),
-) {
-	// Process x-phone and x-email headers
-	if phoneHeader, err := getHeader("x-phone"); err == nil && phoneHeader != "" {
-		maskedPhone := ctx.maskPhone(phoneHeader)
-		replaceHeader("x-phone", maskedPhone)
-	}
-	if emailHeader, err := getHeader("x-email"); err == nil && emailHeader != "" {
-		maskedEmail := ctx.maskEmail(emailHeader)
-		replaceHeader("x-email", maskedEmail)
-	}
-
-	// Also scan all headers for PII
-	if headers, err := getAllHeaders(); err == nil {
-		for _, header := range headers {
-			name, value := header[0], header[1]
-			if name != "x-phone" && name != "x-email" {
-				// Performance optimization. Only replace if a match is found.
-				if !ctx.phoneRegex.MatchString(value) && !ctx.emailRegex.MatchString(value) {
-					continue
-				}
-
-				newValue := ctx.maskPhone(value)
-				newValue = ctx.maskEmail(newValue)
-
-				if value != newValue {
-					replaceHeader(name, newValue)
-				}
-			}
-		}
+		phoneRegex: pluginContext.phoneRegex,
+		emailRegex: pluginContext.emailRegex,
 	}
 }
 
@@ -109,11 +68,28 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		}
 	}()
 
-	ctx.processHeaders(
-		proxywasm.GetHttpRequestHeader,
-		proxywasm.ReplaceHttpRequestHeader,
-		proxywasm.GetHttpRequestHeaders,
-	)
+	// Get all headers
+	headers, err := proxywasm.GetHttpRequestHeaders()
+	if err != nil {
+		proxywasm.LogError(fmt.Sprintf("failed to get request headers: %v", err))
+		return types.ActionContinue
+	}
+
+	// Process each header uniformly
+	for _, header := range headers {
+		name, value := header[0], header[1]
+
+		// Apply masking operations sequentially
+		newValue := ctx.maskPhone(value)
+		newValue = ctx.maskEmail(newValue)
+
+		// Only replace if the value has changed
+		if value != newValue {
+			if err := proxywasm.ReplaceHttpRequestHeader(name, newValue); err != nil {
+				proxywasm.LogError(fmt.Sprintf("failed to replace request header: %v", err))
+			}
+		}
+	}
 
 	return types.ActionContinue
 }
@@ -126,11 +102,28 @@ func (ctx *httpContext) OnHttpResponseHeaders(numHeaders int, endOfStream bool) 
 		}
 	}()
 
-	ctx.processHeaders(
-		proxywasm.GetHttpResponseHeader,
-		proxywasm.ReplaceHttpResponseHeader,
-		proxywasm.GetHttpResponseHeaders,
-	)
+	// Get all headers
+	headers, err := proxywasm.GetHttpResponseHeaders()
+	if err != nil {
+		proxywasm.LogError(fmt.Sprintf("failed to get response headers: %v", err))
+		return types.ActionContinue
+	}
+
+	// Process each header uniformly
+	for _, header := range headers {
+		name, value := header[0], header[1]
+
+		// Apply masking operations sequentially
+		newValue := ctx.maskPhone(value)
+		newValue = ctx.maskEmail(newValue)
+
+		// Only replace if the value has changed
+		if value != newValue {
+			if err := proxywasm.ReplaceHttpResponseHeader(name, newValue); err != nil {
+				proxywasm.LogError(fmt.Sprintf("failed to replace response header: %v", err))
+			}
+		}
+	}
 
 	return types.ActionContinue
 }
@@ -154,8 +147,8 @@ func (ctx *httpContext) OnHttpResponseBody(numBytes int, endOfStream bool) types
 	bodyStr := string(bodyBytes)
 
 	// Apply masking to body content
-	maskedBody := ctx.phoneRegex.ReplaceAllStringFunc(bodyStr, ctx.maskPhone)
-	maskedBody = ctx.emailRegex.ReplaceAllStringFunc(maskedBody, ctx.maskEmail)
+	maskedBody := ctx.maskPhone(bodyStr)
+	maskedBody = ctx.maskEmail(maskedBody)
 
 	// Only replace if changes were made
 	if bodyStr != maskedBody {
@@ -175,25 +168,19 @@ func (ctx *httpContext) maskPhone(phone string) string {
 
 // Email masking function
 func (ctx *httpContext) maskEmail(email string) string {
-	// First try to use the specialized emailMaskRegex for optimal masking
-	if ctx.emailMaskRegex.MatchString(email) {
-		return ctx.emailRegex.ReplaceAllStringFunc(email, func(match string) string {
-			parts := ctx.emailRegex.FindStringSubmatch(match)
-			if len(parts) >= 3 {
-				username := parts[1]
-				domain := parts[2]
+	return ctx.emailRegex.ReplaceAllStringFunc(email, func(match string) string {
+		parts := ctx.emailRegex.FindStringSubmatch(match)
+		if len(parts) >= 3 {
+			username := parts[1]
+			domain := parts[2]
 
-				if len(username) > 0 {
-					firstChar := string(username[0])
-					return firstChar + "**@" + domain
-				}
+			if len(username) > 0 {
+				firstChar := string(username[0])
+				return firstChar + "**@" + domain
 			}
-			return match // Return original if pattern doesn't match expectations
-		})
-	} else {
-		// Fallback to general pattern
-		return ctx.emailRegex.ReplaceAllString(email, "$1**@$2")
-	}
+		}
+		return match // Return original if pattern doesn't match expectations
+	})
 }
 
 // [END serviceextensions_plugin_mask_pii]
