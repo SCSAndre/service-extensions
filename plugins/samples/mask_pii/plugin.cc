@@ -28,11 +28,15 @@ class MyRootContext : public RootContext {
     // Email regex - simple pattern for email matching
     email_regex.emplace("([a-zA-Z0-9._%+\\-]+)@([a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,})");
 
-    return phone_regex->ok() && email_regex->ok();
+    // Email masking regex - captures first character separately
+    email_mask_regex.emplace("([a-zA-Z0-9._%+\\-])[a-zA-Z0-9._%+\\-]*@([a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,})");
+
+    return phone_regex->ok() && email_regex->ok() && email_mask_regex->ok();
   }
 
   std::optional<re2::RE2> phone_regex;
   std::optional<re2::RE2> email_regex;
+  std::optional<re2::RE2> email_mask_regex;
 };
 
 class MyHttpContext : public Context {
@@ -41,20 +45,44 @@ class MyHttpContext : public Context {
       : Context(id, root), root_(static_cast<MyRootContext*>(root)) {}
 
   FilterHeadersStatus onRequestHeaders(uint32_t headers, bool end_of_stream) override {
-    processHeaders(
-        [this]() { return getRequestHeaderPairs(); },
-        [this](std::string_view name) { return getRequestHeader(name); },
-        [this](std::string_view name, std::string_view value) { replaceRequestHeader(name, value); }
-    );
+    const auto result = getRequestHeaderPairs();
+    const auto pairs = result->pairs();
+    bool changed = false;
+
+    for (auto& p : pairs) {
+      std::string header_value = std::string(p.second);
+      bool header_changed = false;
+
+      header_changed |= maskPhone(header_value);
+      header_changed |= maskEmail(header_value);
+
+      if (header_changed) {
+        replaceRequestHeader(p.first, header_value);
+        changed = true;
+      }
+    }
+
     return FilterHeadersStatus::Continue;
   }
 
   FilterHeadersStatus onResponseHeaders(uint32_t headers, bool end_of_stream) override {
-    processHeaders(
-        [this]() { return getResponseHeaderPairs(); },
-        [this](std::string_view name) { return getResponseHeader(name); },
-        [this](std::string_view name, std::string_view value) { replaceResponseHeader(name, value); }
-    );
+    const auto result = getResponseHeaderPairs();
+    const auto pairs = result->pairs();
+    bool changed = false;
+
+    for (auto& p : pairs) {
+      std::string header_value = std::string(p.second);
+      bool header_changed = false;
+
+      header_changed |= maskPhone(header_value);
+      header_changed |= maskEmail(header_value);
+
+      if (header_changed) {
+        replaceResponseHeader(p.first, header_value);
+        changed = true;
+      }
+    }
+
     return FilterHeadersStatus::Continue;
   }
 
@@ -78,42 +106,6 @@ class MyHttpContext : public Context {
  private:
   const MyRootContext* root_;
 
-  template <typename GetAllHeadersFunc, typename GetHeaderFunc, typename ReplaceHeaderFunc>
-    void processHeaders(GetAllHeadersFunc get_all_headers, GetHeaderFunc get_header, ReplaceHeaderFunc replace_header) {
-      // Process x-phone header
-      if (const auto phone_header = get_header("x-phone")) {
-        std::string header_value = std::string(phone_header->view());
-        if (maskPhone(header_value)) {
-          replace_header("x-phone", header_value);
-        }
-      }
-
-      // Process x-email header
-      if (const auto email_header = get_header("x-email")) {
-        std::string header_value = std::string(email_header->view());
-        if (maskEmail(header_value)) {
-          replace_header("x-email", header_value);
-        }
-      }
-
-      // Process all other headers for PII
-      const auto result = get_all_headers();
-      const auto pairs = result->pairs();
-      for (auto& p : pairs) {
-        if (p.first != "x-phone" && p.first != "x-email") {
-          std::string header_value = std::string(p.second);
-          bool changed = false;
-
-          changed |= maskPhone(header_value);
-          changed |= maskEmail(header_value);
-
-          if (changed) {
-            replace_header(p.first, header_value);
-          }
-        }
-      }
-    }
-
   // Masks phone numbers in the format XXX-XXX-XXXX, preserving the last 4 digits
   bool maskPhone(std::string& value) {
     return re2::RE2::GlobalReplace(&value, *root_->phone_regex, "XXX-XXX-\\3") > 0;
@@ -121,9 +113,7 @@ class MyHttpContext : public Context {
 
   // Masks email addresses in the format x**@domain.com
   bool maskEmail(std::string& value) {
-    // Create a pattern that specifically captures just the first character of the username
-    std::string pattern = "([a-zA-Z0-9._%+\\-])[a-zA-Z0-9._%+\\-]*@([a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,})";
-    return re2::RE2::GlobalReplace(&value, pattern, "\\1**@\\2") > 0;
+    return re2::RE2::GlobalReplace(&value, *root_->email_mask_regex, "\\1**@\\2") > 0;
   }
 };
 
