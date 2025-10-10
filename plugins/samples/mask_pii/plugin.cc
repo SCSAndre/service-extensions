@@ -25,17 +25,13 @@ class MyRootContext : public RootContext {
     // Phone regex for format XXX-XXX-XXXX
     phone_regex.emplace("(\\d{3})-(\\d{3})-(\\d{4})");
 
-    // Email regex - simple pattern for email matching
-    email_regex.emplace("([a-zA-Z0-9._%+\\-]+)@([a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,})");
-
     // Email masking regex - captures first character separately
     email_mask_regex.emplace("([a-zA-Z0-9._%+\\-])[a-zA-Z0-9._%+\\-]*@([a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,})");
 
-    return phone_regex->ok() && email_regex->ok() && email_mask_regex->ok();
+    return phone_regex->ok() && email_mask_regex->ok();
   }
 
   std::optional<re2::RE2> phone_regex;
-  std::optional<re2::RE2> email_regex;
   std::optional<re2::RE2> email_mask_regex;
 };
 
