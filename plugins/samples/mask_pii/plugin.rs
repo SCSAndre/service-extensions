@@ -16,59 +16,48 @@
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use regex::Regex;
-use std::borrow::Cow;
 use std::rc::Rc;
 
 proxy_wasm::main! {{
     proxy_wasm::set_log_level(LogLevel::Trace);
     proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
-        Box::new(MyRootContext::new())
+        Box::new(PiiMaskingRoot::default())
     });
 }}
 
-struct MyRootContext {
-    phone_regex: Option<Rc<Regex>>,
-    email_regex: Option<Rc<Regex>>,
+#[derive(Default)]
+struct PiiMaskingRoot {
+    phone_matcher: Option<Rc<Regex>>,
+    email_matcher: Option<Rc<Regex>>,
 }
 
-impl MyRootContext {
-    fn new() -> Self {
-        MyRootContext {
-            phone_regex: None,
-            email_regex: None,
-        }
-    }
-}
+impl Context for PiiMaskingRoot {}
 
-impl Context for MyRootContext {}
-
-impl RootContext for MyRootContext {
-    fn on_configure(&mut self, _config_size: usize) -> bool {
-        // Phone regex for format XXX-XXX-XXXX
-        let phone_regex = Regex::new(r"(\d{3})-(\d{3})-(\d{4})");
-        if phone_regex.is_err() {
-            log(LogLevel::Error, &format!("Failed to compile phone regex: {:?}", phone_regex.err()));
-            return false;
+impl RootContext for PiiMaskingRoot {
+    fn on_configure(&mut self, _: usize) -> bool {
+        // Compile regex patterns once during configuration
+        match Regex::new(r"(\d{3})-(\d{3})-(\d{4})") {
+            Ok(re) => self.phone_matcher = Some(Rc::new(re)),
+            Err(_) => return false,
         }
 
-        // Email regex - captures username and domain parts separately
-        let email_regex = Regex::new(r"([a-zA-Z0-9._%+\-]+)@([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})");
-        if email_regex.is_err() {
-            log(LogLevel::Error, &format!("Failed to compile email regex: {:?}", email_regex.err()));
-            return false;
+        match Regex::new(r"([a-zA-Z0-9._%+\-])[a-zA-Z0-9._%+\-]*@([a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})") {
+            Ok(re) => self.email_matcher = Some(Rc::new(re)),
+            Err(_) => return false,
         }
-
-        self.phone_regex = Some(Rc::new(phone_regex.unwrap()));
-        self.email_regex = Some(Rc::new(email_regex.unwrap()));
 
         true
     }
 
-    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
-        Some(Box::new(MyHttpContext::new(
-            self.phone_regex.clone(),
-            self.email_regex.clone(),
-        )))
+    fn create_http_context(&self, _: u32) -> Option<Box<dyn HttpContext>> {
+        // Pass the compiled regex patterns to the HTTP context
+        let phone_matcher = self.phone_matcher.as_ref().map(Rc::clone);
+        let email_matcher = self.email_matcher.as_ref().map(Rc::clone);
+
+        Some(Box::new(PiiMaskingHttp {
+            phone_matcher,
+            email_matcher,
+        }))
     }
 
     fn get_type(&self) -> Option<ContextType> {
@@ -76,188 +65,95 @@ impl RootContext for MyRootContext {
     }
 }
 
-struct MyHttpContext {
-    phone_regex: Option<Rc<Regex>>,
-    email_regex: Option<Rc<Regex>>,
+struct PiiMaskingHttp {
+    phone_matcher: Option<Rc<Regex>>,
+    email_matcher: Option<Rc<Regex>>,
 }
 
-impl MyHttpContext {
-    fn new(
-        phone_regex: Option<Rc<Regex>>,
-        email_regex: Option<Rc<Regex>>,
-    ) -> Self {
-        MyHttpContext {
-            phone_regex,
-            email_regex,
+impl PiiMaskingHttp {
+    // Mask phone numbers using pre-compiled regex
+    fn mask_phone(&self, text: &str) -> String {
+        if let Some(re) = &self.phone_matcher {
+            re.replace_all(text, "XXX-XXX-$3").to_string()
+        } else {
+            text.to_string()
         }
     }
 
-    /// Process headers with a uniform approach for both request and response
-    fn process_headers(&mut self, is_request: bool) -> Action {
-        // Get headers
-        let headers = if is_request {
-            self.get_http_request_headers()
+    // Mask email addresses using pre-compiled regex
+    fn mask_email(&self, text: &str) -> String {
+        if let Some(re) = &self.email_matcher {
+            re.replace_all(text, "$1**@$2").to_string()
         } else {
-            self.get_http_response_headers()
-        };
-
-        let mut changed = false;
-        let mut updated_headers = Vec::with_capacity(headers.len());
-
-        // Process specific headers (x-phone, x-email) first
-        let mut phone_header_value = String::new();
-        let mut email_header_value = String::new();
-        let mut has_phone_header = false;
-        let mut has_email_header = false;
-
-        for (name, value) in &headers {
-            if name == "x-phone" {
-                phone_header_value = value.clone();
-                has_phone_header = true;
-            } else if name == "x-email" {
-                email_header_value = value.clone();
-                has_email_header = true;
-            }
+            text.to_string()
         }
+    }
 
-        // Mask x-phone if present
-        if has_phone_header {
-            let mut phone_value = phone_header_value;
-            if self.mask_pii(&mut phone_value) {
-                changed = true;
-                if is_request {
-                    self.set_http_request_header("x-phone", Some(&phone_value));
-                } else {
-                    self.set_http_response_header("x-phone", Some(&phone_value));
-                }
-            }
-        }
+    // Process text by applying all PII masking operations
+    fn process_text(&self, text: &str) -> String {
+        let mut result = text.to_string();
+        result = self.mask_phone(&result);
+        result = self.mask_email(&result);
+        result
+    }
+}
 
-        // Mask x-email if present
-        if has_email_header {
-            let mut email_value = email_header_value;
-            if self.mask_pii(&mut email_value) {
-                changed = true;
-                if is_request {
-                    self.set_http_request_header("x-email", Some(&email_value));
-                } else {
-                    self.set_http_response_header("x-email", Some(&email_value));
-                }
-            }
-        }
+impl Context for PiiMaskingHttp {}
 
-        // Process all other headers for PII
+impl HttpContext for PiiMaskingHttp {
+    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+        // Set Accept-Encoding to ensure uncompressed responses
+        self.set_http_request_header("accept-encoding", Some("identity"));
+
+        // Get all headers at once
+        let headers = self.get_http_request_headers();
+
+        // Process each header uniformly
         for (name, value) in headers {
-            if name != "x-phone" && name != "x-email" {
-                // Performance optimization: check if there's PII before processing
-                if let (Some(ref phone_re), Some(ref email_re)) = (&self.phone_regex, &self.email_regex) {
-                    if !phone_re.is_match(&value) && !email_re.is_match(&value) {
-                        updated_headers.push((name, value));
-                        continue;
-                    }
-                }
+            let masked_value = self.process_text(&value);
 
-                // Process header value
-                let mut new_value = value;
-                if self.mask_pii(&mut new_value) {
-                    changed = true;
-                }
-                updated_headers.push((name, new_value));
-            }
-        }
-
-        // Update headers if any values changed
-        if changed {
-            let new_headers_refs: Vec<(&str, &str)> = updated_headers
-                .iter()
-                .map(|(n, v)| (n.as_str(), v.as_str()))
-                .collect();
-
-            if is_request {
-                self.set_http_request_headers(new_headers_refs);
-            } else {
-                self.set_http_response_headers(new_headers_refs);
+            // Only update if changed
+            if masked_value != value {
+                self.set_http_request_header(&name, Some(&masked_value));
             }
         }
 
         Action::Continue
     }
 
-    /// Mask PII (phone numbers and email addresses) in-place on a given string,
-    /// returning `true` if modifications occurred.
-    fn mask_pii(&self, text: &mut String) -> bool {
-        let mut modified = false;
+    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
+        // Get all headers at once
+        let headers = self.get_http_response_headers();
 
-        // Mask phone numbers
-        if let Some(ref phone_re) = self.phone_regex {
-            let replaced = phone_re.replace_all(text, "XXX-XXX-$3");
-            if replaced != Cow::Borrowed(text.as_str()) {
-                *text = replaced.to_string();
-                modified = true;
+        // Process each header uniformly
+        for (name, value) in headers {
+            let masked_value = self.process_text(&value);
+
+            // Only update if changed
+            if masked_value != value {
+                self.set_http_response_header(&name, Some(&masked_value));
             }
         }
 
-        // Mask email addresses
-        if let Some(ref email_re) = self.email_regex {
-            let replaced = email_re.replace_all(text, |caps: &regex::Captures| {
-                let username = &caps[1];
-                let domain = &caps[2];
-
-                if !username.is_empty() {
-                    // Keep first character of username, mask the rest with **
-                    format!("{}**@{}", &username[0..1], domain)
-                } else {
-                    caps[0].to_string()
-                }
-            });
-
-            if replaced != Cow::Borrowed(text.as_str()) {
-                *text = replaced.to_string();
-                modified = true;
-            }
-        }
-
-        modified
-    }
-}
-
-impl Context for MyHttpContext {}
-
-impl HttpContext for MyHttpContext {
-    fn on_http_request_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
-        // Set Accept-Encoding to ensure uncompressed responses
-        self.set_http_request_header("accept-encoding", Some("identity"));
-
-        // Process request headers
-        self.process_headers(true)
+        Action::Continue
     }
 
-    fn on_http_response_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
-        // Process response headers
-        self.process_headers(false)
-    }
-
-    fn on_http_response_body(&mut self, body_size: usize, _end_of_stream: bool) -> Action {
+    fn on_http_response_body(&mut self, body_size: usize, _: bool) -> Action {
         if body_size == 0 {
             return Action::Continue;
         }
 
         // Get response body
         if let Some(body_bytes) = self.get_http_response_body(0, body_size) {
-            // Convert to string for processing, assuming UTF-8 encoding
-            match String::from_utf8(body_bytes) {
-                Ok(mut body_string) => {
-                    // Mask PII in body
-                    if self.mask_pii(&mut body_string) {
-                        // Only update if changes were made
-                        if let Err(err) = self.set_http_response_body(0, body_string.len(), body_string.as_bytes()) {
-                            log(LogLevel::Error, &format!("Failed to replace response body: {:?}", err));
-                        }
-                    }
-                }
-                Err(err) => {
-                    log(LogLevel::Error, &format!("Failed to convert body to string: {:?}", err));
-                }
+            // Use lossy conversion for UTF-8 - more robust than unwrapping
+            let body_str = String::from_utf8_lossy(&body_bytes);
+
+            // Process the body
+            let masked_body = self.process_text(&body_str);
+
+            // Only update if changed, using ORIGINAL body_size
+            if masked_body != body_str {
+                self.set_http_response_body(0, body_size, masked_body.as_bytes());
             }
         }
 
