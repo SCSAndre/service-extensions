@@ -26,7 +26,6 @@ proxy_wasm::main! {{
     });
 }}
 
-#[derive(Default)]
 struct MyRootContext {
     phone_matcher: Option<Rc<Regex>>,
     email_matcher: Option<Rc<Regex>>,
